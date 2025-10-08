@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:collection/collection.dart';
 import 'package:http/http.dart' as http;
 import 'package:meta/meta.dart';
+import 'package:tinydb_client/tinydb_client.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -823,12 +824,14 @@ class TinyDBException implements Exception {
   final int status;
   final String? code;
   final dynamic details;
+  final String? requestId;
 
-  TinyDBException(this.message, this.status, {this.code, this.details});
+  TinyDBException(this.message, this.status,
+      {this.code, this.details, this.requestId});
 
   @override
   String toString() =>
-      'TinyDBException(status: $status, code: $code, message: $message)';
+      'TinyDBException(status: $status, code: $code, message: $message, requestId: $requestId)';
 }
 
 class TinyDBClient {
@@ -880,7 +883,8 @@ class TinyDBClient {
         .toList(growable: false);
   }
 
-  Future<CollectionCount> countCollections({bool includeDeleted = false}) async {
+  Future<CollectionCount> countCollections(
+      {bool includeDeleted = false}) async {
     final response = await _request<Map<String, dynamic>>(
       method: 'GET',
       path: '/api/collections/count',
@@ -1142,6 +1146,8 @@ class TinyDBClient {
     final request = http.Request(method, uri);
     request.headers['Accept'] = 'application/json';
     request.headers['X-API-Key'] = _apiKey;
+    request.headers['user-agent'] =
+        'tinydb-sdk-dart/v${VersionReader.getVersion() ?? "0.1.0"} (+https://github.com/cubetiqlabs/tinydb-sdk-dart)';
     if (_appId != null) {
       request.headers['X-App-ID'] = _appId!;
     }
@@ -1240,6 +1246,8 @@ class TinyDBClient {
     final uri = _buildWebSocketUri(path, query: query);
     final headers = <String, dynamic>{
       'authorization': 'Bearer $_apiKey',
+      'user-agent':
+          'tinydb-sdk-dart/v${VersionReader.getVersion() ?? "0.1.0"} (+https://github.com/cubetiqlabs/tinydb-sdk-dart)',
     };
     if (_appId != null && _appId!.isNotEmpty) {
       headers['x-app-id'] = _appId;
@@ -1274,6 +1282,7 @@ class TinyDBClient {
       response.statusCode,
       code: code?.toString(),
       details: payload,
+      requestId: response.headers['x-request-id'],
     );
   }
 }

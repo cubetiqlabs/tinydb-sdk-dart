@@ -5,7 +5,7 @@ repository: https://github.com/cubetiqlabs/tinydb-sdk-dart.git
 publish_to: "none"
 
 environment:
-  sdk: '>=3.1.0 <4.0.0'
+  sdk: ">=3.1.0 <4.0.0"
 
 dependencies:
   http: ^1.2.0
