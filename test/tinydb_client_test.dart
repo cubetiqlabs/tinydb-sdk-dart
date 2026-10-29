@@ -2001,6 +2001,306 @@ void main() {
           [CollectionWatchEventKind.initial, CollectionWatchEventKind.ack]);
     });
   });
+
+  group('resilience', () {
+    http.Response json(Object body,
+            [int status = 200, Map<String, String>? h]) =>
+        http.Response(jsonEncode(body), status,
+            headers: {'content-type': 'application/json', ...?h});
+
+    TinyDBClient clientFor(
+      Future<http.Response> Function(http.Request) handler, {
+      List<Duration>? sleeps,
+      RetryPolicy? policy,
+    }) {
+      return TinyDBClient(
+        endpoint: 'https://db.example.com',
+        apiKey: 'k',
+        httpClient: MockClient(handler),
+        retryPolicy: policy ??
+            RetryPolicy(
+              sleep: (d) async => sleeps?.add(d),
+              random: () => 0.5,
+            ),
+      );
+    }
+
+    test('retries a GET on 503 with jittered exponential backoff', () async {
+      final sleeps = <Duration>[];
+      var calls = 0;
+      final client = clientFor((r) async {
+        calls++;
+        return calls < 3 ? json({'error': 'x'}, 503) : json(<Object>[]);
+      }, sleeps: sleeps);
+      await client.collections();
+      expect(calls, 3);
+      expect(sleeps, [
+        const Duration(milliseconds: 100),
+        const Duration(milliseconds: 200),
+      ]);
+    });
+
+    test('gives up after the configured retries with a ServerException',
+        () async {
+      var calls = 0;
+      final client = clientFor((r) async {
+        calls++;
+        return json({'error': 'x'}, 503);
+      });
+      await expectLater(client.collections(), throwsA(isA<ServerException>()));
+      expect(calls, 3);
+    });
+
+    test('does not retry a POST without an idempotency key', () async {
+      var calls = 0;
+      final client = clientFor((r) async {
+        calls++;
+        return json({}, 503);
+      });
+      final col = CollectionClient<JsonMap>(
+          client, 'users', CollectionDetails.fromJson(baseCollectionResponse));
+      await expectLater(col.create({'a': 1}), throwsA(isA<ServerException>()));
+      expect(calls, 1);
+    });
+
+    test('retries a POST that carries a key, resending the same key', () async {
+      final keys = <String?>[];
+      var calls = 0;
+      final client = clientFor((r) async {
+        calls++;
+        keys.add(r.headers['Idempotency-Key']);
+        return calls == 1
+            ? json({}, 503)
+            : json({
+                'id': 'd1',
+                'tenant_id': 't',
+                'collection_id': 'users',
+                'key': 'k',
+                'data': {'a': 1},
+                'created_at': '2024-01-01T00:00:00Z',
+                'updated_at': '2024-01-01T00:00:00Z',
+              }, 201);
+      });
+      final key = newIdempotencyKey();
+      final col = CollectionClient<JsonMap>(
+          client, 'users', CollectionDetails.fromJson(baseCollectionResponse));
+      final doc = await col.create({'a': 1}, idempotencyKey: key);
+      expect(doc.id, 'd1');
+      expect(keys, [key, key]);
+    });
+
+    test('newIdempotencyKey returns distinct v4 uuids', () {
+      final a = newIdempotencyKey();
+      expect(
+          a,
+          matches(RegExp(
+              r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')));
+      expect(newIdempotencyKey(), isNot(a));
+    });
+
+    test('honours Retry-After on 429', () async {
+      final sleeps = <Duration>[];
+      var calls = 0;
+      final client = clientFor((r) async {
+        calls++;
+        return calls == 1
+            ? json({}, 429, {'retry-after': '2'})
+            : json(<Object>[]);
+      }, sleeps: sleeps);
+      await client.collections();
+      expect(sleeps, [const Duration(seconds: 2)]);
+    });
+
+    test('does not retry a 429 without Retry-After (daily quota)', () async {
+      var calls = 0;
+      final client = clientFor((r) async {
+        calls++;
+        return json({'message': 'daily quota exceeded'}, 429);
+      });
+      await expectLater(
+          client.collections(), throwsA(isA<RateLimitException>()));
+      expect(calls, 1);
+    });
+
+    test('surfaces a Retry-After longer than the cap instead of waiting',
+        () async {
+      final client =
+          clientFor((r) async => json({}, 429, {'retry-after': '3600'}));
+      try {
+        await client.collections();
+        fail('expected RateLimitException');
+      } on RateLimitException catch (e) {
+        expect(e.retryAfter, const Duration(hours: 1));
+      }
+    });
+
+    test('retry can be disabled', () async {
+      var calls = 0;
+      final client = clientFor((r) async {
+        calls++;
+        return json({}, 503);
+      }, policy: RetryPolicy.none);
+      await expectLater(client.collections(), throwsA(isA<ServerException>()));
+      expect(calls, 1);
+    });
+
+    test('maps statuses to typed exceptions that are still TinyDBExceptions',
+        () async {
+      final cases = <int, Matcher>{
+        401: isA<UnauthorizedException>(),
+        403: isA<ForbiddenException>(),
+        404: isA<NotFoundException>(),
+        409: isA<ConflictException>(),
+        412: isA<ConflictException>(),
+        422: isA<ValidationException>(),
+      };
+      for (final entry in cases.entries) {
+        final client = clientFor(
+            (r) async => json({'message': 'why'}, entry.key),
+            policy: RetryPolicy.none);
+        await expectLater(
+          client.collections(),
+          throwsA(allOf(
+              entry.value,
+              isA<TinyDBException>(),
+              predicate<TinyDBException>(
+                  (e) => e.status == entry.key && e.message == 'why'))),
+          reason: 'status ${entry.key}',
+        );
+      }
+    });
+
+    test('usage, verifyAudit and audit call the new endpoints', () async {
+      final paths = <String>[];
+      final client = clientFor((r) async {
+        paths.add('${r.url.path}?${r.url.query}');
+        if (r.url.path == '/api/usage') {
+          return json({
+            'usage': {'documents': 3}
+          });
+        }
+        if (r.url.path == '/api/audit/verify') {
+          return json({
+            'ok': false,
+            'checked': 4,
+            'unsealed': 1,
+            'broken_seq': 3,
+            'reason': 'entry content does not match its hash'
+          });
+        }
+        return json([
+          {'id': 1, 'operation': 'update'}
+        ]);
+      });
+      expect((await client.usage(days: 7))['usage']['documents'], 3);
+      final v = await client.verifyAudit();
+      expect(v.ok, isFalse);
+      expect(v.brokenSeq, 3);
+      expect(v.reason, contains('content'));
+      final rows = await client.audit(operation: 'update', limit: 5);
+      expect(rows.single['operation'], 'update');
+      expect(paths, [
+        '/api/usage?days=7',
+        '/api/audit/verify?',
+        '/api/audit?limit=5&operation=update',
+      ]);
+    });
+  });
+
+  group('watch resume', () {
+    TinyDBClient wsClient(List<TestWebSocketChannel> sockets, List<Uri> uris,
+        List<Map<String, dynamic>?> seenHeaders) {
+      var n = 0;
+      return TinyDBClient(
+        endpoint: 'https://db.example.com',
+        apiKey: 'demo-key',
+        httpClient: MockClient((r) async => fail('unexpected ${r.url}')),
+        webSocketConnector: (uri, {protocols, headers, pingInterval}) {
+          uris.add(uri);
+          seenHeaders.add(headers);
+          return sockets[n++];
+        },
+      );
+    }
+
+    CollectionClient<JsonMap> users(TinyDBClient c) =>
+        CollectionClient<JsonMap>(
+            c, 'users', CollectionDetails.fromJson(baseCollectionResponse));
+
+    test('authenticates with X-API-Key and asks to resume after since',
+        () async {
+      final ws = TestWebSocketChannel();
+      final uris = <Uri>[];
+      final hdrs = <Map<String, dynamic>?>[];
+      final client = wsClient([ws], uris, hdrs);
+      final queue =
+          StreamQueue(users(client).watch(includeInitial: false, since: 41));
+      final laggedFuture = queue.next; // listening is what opens the socket
+      await ws.onListen.timeout(const Duration(seconds: 5));
+      ws.addServerMessage(jsonEncode({'type': 'lagged', 'seq': 41}));
+      ws.addServerMessage(jsonEncode({
+        'seq': 42,
+        'type': 'create',
+        'id': 'd',
+        'data': {'uid': 'u'}
+      }));
+      final lagged = await laggedFuture.timeout(const Duration(seconds: 5));
+      final created = await queue.next.timeout(const Duration(seconds: 5));
+      await queue.cancel(immediate: true);
+      await ws.shutdown();
+
+      expect(uris.single.queryParameters['since'], '41');
+      expect(hdrs.single?['x-api-key'], 'demo-key');
+      expect(lagged.kind, CollectionWatchEventKind.lagged);
+      expect(created.seq, 42);
+    });
+
+    test('reconnects after a drop and resumes after the last seq', () async {
+      final first = TestWebSocketChannel();
+      final second = TestWebSocketChannel();
+      final uris = <Uri>[];
+      final client = wsClient([first, second], uris, []);
+      final queue = StreamQueue(users(client).watch(
+        includeInitial: false,
+        reconnect: true,
+        reconnectDelay: const Duration(milliseconds: 1),
+      ));
+      final firstEvent = queue.next; // listening is what opens the socket
+      await first.onListen.timeout(const Duration(seconds: 5));
+      first.addServerMessage(
+          jsonEncode({'seq': 5, 'type': 'create', 'id': 'a', 'data': {}}));
+      first.addServerMessage(
+          jsonEncode({'seq': 6, 'type': 'update', 'id': 'a', 'data': {}}));
+      expect((await firstEvent.timeout(const Duration(seconds: 5))).seq, 5);
+      expect((await queue.next.timeout(const Duration(seconds: 5))).seq, 6);
+
+      unawaited(first.shutdown()); // connection drops
+      await second.onListen.timeout(const Duration(seconds: 5));
+      second.addServerMessage(
+          jsonEncode({'seq': 7, 'type': 'delete', 'id': 'a'}));
+      final ev = await queue.next.timeout(const Duration(seconds: 5));
+      await queue.cancel(immediate: true);
+      unawaited(second.shutdown());
+
+      expect(ev.seq, 7);
+      expect(uris, hasLength(2));
+      expect(uris[0].queryParameters.containsKey('since'), isFalse);
+      expect(uris[1].queryParameters['since'], '6');
+    });
+
+    test('without reconnect a drop closes the stream', () async {
+      final ws = TestWebSocketChannel();
+      final client = wsClient([ws], [], []);
+      final events = <CollectionWatchEvent<JsonMap>>[];
+      final done = users(client)
+          .watch(includeInitial: false)
+          .listen(events.add)
+          .asFuture<void>();
+      await ws.onListen.timeout(const Duration(seconds: 5));
+      unawaited(ws.shutdown());
+      await done.timeout(const Duration(seconds: 5));
+    });
+  });
 }
 
 class TestWebSocketChannel with StreamChannelMixin implements WebSocketChannel {

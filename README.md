@@ -181,6 +181,55 @@ await for (final record in users.queryStream(
 `queryStream` is built on top of `queryPages` and emits each `DocumentRecord` immediately. It honours the same throttling parameters (`pageLimit`, `maxPages`, `maxItems`) so you can cap the work while still benefiting from a simple async `for` loop.
 Specify `onProgress` to receive updates once each page is drained (including total items streamed so far and whether more data remains).
 
+### Retries, idempotency and typed errors
+
+Transient failures (network errors, `429`, `502`, `503`, `504`) are retried with exponential backoff and full jitter, honouring `Retry-After`. A `429` without `Retry-After` (a daily quota) is not retried. `GET`/`PUT`/`DELETE` retry freely; a `POST` retries **only** when it carries an idempotency key, so a retry can never create a second document:
+
+```dart
+final client = TinyDBClient(
+  endpoint: endpoint,
+  apiKey: apiKey,
+  retryPolicy: const RetryPolicy(retries: 3), // RetryPolicy.none turns it off
+);
+
+await users.create({'name': 'Alice'}, idempotencyKey: newIdempotencyKey());
+
+try {
+  await users.list();
+} on RateLimitException catch (e) {
+  await Future.delayed(e.retryAfter ?? const Duration(seconds: 5));
+} on ForbiddenException catch (e) {
+  // suspended tenant or a plan limit: e.message says which
+}
+```
+
+Errors are `UnauthorizedException`, `ForbiddenException`, `NotFoundException`, `ConflictException`, `ValidationException`, `RateLimitException` and `ServerException`, all subclasses of `TinyDBException`, so existing `on TinyDBException` handlers keep working.
+
+### Resume a watch after a disconnect
+
+Each change carries a `seq`. Keep the last one you processed and pass it as `since`; with `reconnect: true` the client does this itself when the socket drops:
+
+```dart
+var cursor = await loadCursor();
+await for (final event in users.watch(since: cursor, reconnect: true)) {
+  if (event.kind == CollectionWatchEventKind.lagged) continue; // missed changes follow
+  apply(event);
+  cursor = event.seq ?? cursor;
+  await saveCursor(cursor);
+}
+```
+
+`watch` now authenticates with `X-API-Key`; earlier versions sent only a Bearer header, which the server does not read.
+
+### Account and audit
+
+```dart
+final usage = await client.usage(days: 30);   // plan, limits, usage, daily requests
+final verdict = await client.verifyAudit();   // tamper-evident audit chain
+if (!verdict.ok) print('broken at ${verdict.brokenSeq}: ${verdict.reason}');
+final rows = await client.audit(operation: 'update', limit: 50);
+```
+
 ### Run the example against a real API
 
 ```bash

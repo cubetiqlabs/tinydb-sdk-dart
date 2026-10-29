@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show HttpDate;
+import 'dart:math' as math;
 
 import 'package:collection/collection.dart';
 import 'package:http/http.dart' as http;
@@ -30,6 +32,17 @@ WebSocketChannel _defaultWebSocketConnector(
 }
 
 typedef JsonMap = Map<String, dynamic>;
+
+/// A fresh random key for the `idempotencyKey` argument of write calls.
+String newIdempotencyKey() {
+  final rnd = math.Random.secure();
+  final b = List<int>.generate(16, (_) => rnd.nextInt(256));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  String h(int i) => b[i].toRadixString(16).padLeft(2, '0');
+  return '${h(0)}${h(1)}${h(2)}${h(3)}-${h(4)}${h(5)}-${h(6)}${h(7)}-${h(8)}${h(9)}-'
+      '${h(10)}${h(11)}${h(12)}${h(13)}${h(14)}${h(15)}';
+}
 
 enum FieldType {
   string,
@@ -316,6 +329,9 @@ enum CollectionWatchEventKind {
   delete,
   keepalive,
   error,
+
+  /// This consumer was too slow and events were skipped; the missed changes follow.
+  lagged,
 }
 
 @immutable
@@ -327,6 +343,10 @@ class CollectionWatchEvent<T extends Map<String, dynamic>> {
   final DateTime? timestamp;
   final Map<String, dynamic>? raw;
 
+  /// The cursor of this change. Pass the last one you processed as `since` to
+  /// [CollectionClient.watch] to resume without missing anything.
+  final int? seq;
+
   const CollectionWatchEvent({
     required this.kind,
     this.documentId,
@@ -334,6 +354,7 @@ class CollectionWatchEvent<T extends Map<String, dynamic>> {
     this.document,
     this.timestamp,
     this.raw,
+    this.seq,
   });
 
   factory CollectionWatchEvent.initial(DocumentRecord<T> document) {
@@ -362,6 +383,7 @@ class CollectionWatchEvent<T extends Map<String, dynamic>> {
     DocumentRecord<T>? document,
     DateTime? timestamp,
     Map<String, dynamic>? raw,
+    int? seq,
   }) {
     return CollectionWatchEvent<T>(
       kind: kind,
@@ -370,6 +392,7 @@ class CollectionWatchEvent<T extends Map<String, dynamic>> {
       document: document,
       timestamp: timestamp,
       raw: raw != null ? Map<String, dynamic>.from(raw) : null,
+      seq: seq,
     );
   }
 
@@ -834,6 +857,120 @@ class TinyDBException implements Exception {
       'TinyDBException(status: $status, code: $code, message: $message, requestId: $requestId)';
 }
 
+/// 401: missing or invalid API key.
+class UnauthorizedException extends TinyDBException {
+  UnauthorizedException(String message,
+      {String? code, dynamic details, String? requestId})
+      : super(message, 401, code: code, details: details, requestId: requestId);
+}
+
+/// 403: the key may not do this, the tenant is suspended, or a plan limit was reached.
+class ForbiddenException extends TinyDBException {
+  ForbiddenException(String message,
+      {String? code, dynamic details, String? requestId})
+      : super(message, 403, code: code, details: details, requestId: requestId);
+}
+
+class NotFoundException extends TinyDBException {
+  NotFoundException(String message,
+      {String? code, dynamic details, String? requestId})
+      : super(message, 404, code: code, details: details, requestId: requestId);
+}
+
+/// 409 or 412: a version conflict or a duplicate key.
+class ConflictException extends TinyDBException {
+  ConflictException(super.message, super.status,
+      {super.code, super.details, super.requestId});
+}
+
+/// 400 or 422: the request or the document was rejected.
+class ValidationException extends TinyDBException {
+  ValidationException(super.message, super.status,
+      {super.code, super.details, super.requestId});
+}
+
+/// 429: rate or daily quota exceeded. [retryAfter] is set when the server said when to retry.
+class RateLimitException extends TinyDBException {
+  final Duration? retryAfter;
+  RateLimitException(String message,
+      {this.retryAfter, String? code, dynamic details, String? requestId})
+      : super(message, 429, code: code, details: details, requestId: requestId);
+}
+
+/// 5xx: the server failed.
+class ServerException extends TinyDBException {
+  ServerException(super.message, super.status,
+      {super.code, super.details, super.requestId});
+}
+
+/// How transient failures are retried.
+///
+/// Network errors and 429/502/503/504 are retried with exponential backoff and
+/// full jitter; a `Retry-After` header replaces the computed delay. A 429 with
+/// no `Retry-After` (a daily quota) or one longer than [maxRetryAfter] is not
+/// retried. GET, PUT and DELETE are retried freely; a POST only when it carries
+/// an idempotency key, because repeating it could otherwise duplicate the write.
+class RetryPolicy {
+  final int retries;
+  final Duration baseDelay;
+  final Duration maxDelay;
+  final Duration maxRetryAfter;
+
+  /// Test hooks.
+  final Future<void> Function(Duration)? sleep;
+  final double Function()? random;
+
+  const RetryPolicy({
+    this.retries = 2,
+    this.baseDelay = const Duration(milliseconds: 200),
+    this.maxDelay = const Duration(seconds: 5),
+    this.maxRetryAfter = const Duration(seconds: 30),
+    this.sleep,
+    this.random,
+  });
+
+  /// Never retry.
+  static const none = RetryPolicy(retries: 0);
+}
+
+/// The tenant's audit chain verdict (`GET /api/audit/verify`).
+@immutable
+class AuditVerification {
+  final bool ok;
+  final int checked;
+  final int unsealed;
+  final int? firstSeq;
+  final int? lastSeq;
+
+  /// Keep this outside the database to detect truncation on a later check.
+  final String? lastHash;
+  final int? brokenSeq;
+  final String? reason;
+
+  const AuditVerification({
+    required this.ok,
+    required this.checked,
+    required this.unsealed,
+    this.firstSeq,
+    this.lastSeq,
+    this.lastHash,
+    this.brokenSeq,
+    this.reason,
+  });
+
+  factory AuditVerification.fromJson(Map<String, dynamic> json) =>
+      AuditVerification(
+        ok: json['ok'] == true,
+        checked: (json['checked'] as num?)?.toInt() ?? 0,
+        unsealed: (json['unsealed'] as num?)?.toInt() ?? 0,
+        firstSeq: (json['first_seq'] as num?)?.toInt(),
+        lastSeq: (json['last_seq'] as num?)?.toInt(),
+        lastHash: json['last_hash'] as String?,
+        brokenSeq: (json['broken_seq'] as num?)?.toInt(),
+        reason: json['reason'] as String?,
+      );
+}
+
 class TinyDBClient {
   final String _endpoint;
   final String _apiKey;
@@ -841,6 +978,7 @@ class TinyDBClient {
   final http.Client _httpClient;
   final bool _ownsClient;
   final WebSocketConnector _webSocketConnector;
+  final RetryPolicy _retryPolicy;
 
   TinyDBClient({
     required String endpoint,
@@ -848,7 +986,9 @@ class TinyDBClient {
     String? appId,
     http.Client? httpClient,
     WebSocketConnector? webSocketConnector,
-  })  : _endpoint = _normalizeEndpoint(endpoint),
+    RetryPolicy retryPolicy = const RetryPolicy(),
+  })  : _retryPolicy = retryPolicy,
+        _endpoint = _normalizeEndpoint(endpoint),
         _apiKey = apiKey,
         _appId = appId,
         _httpClient = httpClient ?? http.Client(),
@@ -881,6 +1021,53 @@ class TinyDBClient {
         .cast<Map<String, dynamic>>()
         .map(CollectionDetails.fromJson)
         .toList(growable: false);
+  }
+
+  /// Where the tenant stands against its plan: limits, usage and daily request counts.
+  Future<JsonMap> usage({int? days}) async {
+    return _request<JsonMap>(
+      method: 'GET',
+      path: '/api/usage',
+      query: {'days': days?.toString()},
+    );
+  }
+
+  /// Checks the tenant's tamper-evident audit chain.
+  Future<AuditVerification> verifyAudit() async {
+    final json = await _request<JsonMap>(
+      method: 'GET',
+      path: '/api/audit/verify',
+    );
+    return AuditVerification.fromJson(json);
+  }
+
+  /// Lists audit entries, newest first unless [sort] says otherwise.
+  Future<List<JsonMap>> audit({
+    int? limit,
+    String? collection,
+    String? documentId,
+    String? operation,
+    String? actor,
+    DateTime? since,
+    DateTime? until,
+    String? sort,
+  }) async {
+    final payload = await _request<dynamic>(
+      method: 'GET',
+      path: '/api/audit',
+      query: {
+        'limit': limit?.toString(),
+        'collection': collection,
+        'document_id': documentId,
+        'operation': operation,
+        'actor': actor,
+        'since': since?.toUtc().toIso8601String(),
+        'until': until?.toUtc().toIso8601String(),
+        'sort': sort,
+      },
+    );
+    final items = payload is List ? payload : (payload['items'] as List? ?? []);
+    return items.cast<JsonMap>();
   }
 
   Future<CollectionCount> countCollections(
@@ -1141,38 +1328,69 @@ class TinyDBClient {
     Object? body,
     R Function(dynamic data)? transform,
     bool expectResponseBody = true,
+    String? idempotencyKey,
   }) async {
     final uri = _buildUri(path, query);
-    final request = http.Request(method, uri);
-    request.headers['Accept'] = 'application/json';
-    request.headers['X-API-Key'] = _apiKey;
-    request.headers['user-agent'] =
-        'tinydb-sdk-dart/v${VersionReader.getVersion() ?? "0.1.0"} (+https://github.com/cubetiqlabs/tinydb-sdk-dart)';
-    if (_appId != null) {
-      request.headers['X-App-ID'] = _appId!;
-    }
-    if (body != null) {
-      if (body is String) {
-        request.headers['Content-Type'] =
-            request.headers['Content-Type'] ?? 'application/json';
-        request.body = body;
-      } else if (body is List<int>) {
-        request.bodyBytes = body;
-      } else {
-        request.headers['Content-Type'] = 'application/json';
-        request.body = jsonEncode(body);
-      }
-    }
+    final safeToRepeat = const {'GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS'}
+            .contains(method.toUpperCase()) ||
+        idempotencyKey != null;
+    final policy = _retryPolicy;
+    final sleep = policy.sleep ?? (Duration d) => Future<void>.delayed(d);
+    final random = policy.random ?? _jitter.nextDouble;
 
     http.Response response;
-    try {
-      final streamed = await _httpClient.send(request);
-      response = await http.Response.fromStream(streamed);
-    } catch (error) {
-      throw TinyDBException('Network error: $error', 0);
-    }
+    for (var attempt = 0;; attempt++) {
+      // A request object is single-use, so build a fresh one per attempt.
+      final request = http.Request(method, uri);
+      request.headers['Accept'] = 'application/json';
+      request.headers['X-API-Key'] = _apiKey;
+      request.headers['user-agent'] =
+          'tinydb-sdk-dart/v${VersionReader.getVersion() ?? "0.1.0"} (+https://github.com/cubetiqlabs/tinydb-sdk-dart)';
+      if (_appId != null) {
+        request.headers['X-App-ID'] = _appId!;
+      }
+      if (idempotencyKey != null) {
+        request.headers['Idempotency-Key'] = idempotencyKey;
+      }
+      if (body != null) {
+        if (body is String) {
+          request.headers['Content-Type'] =
+              request.headers['Content-Type'] ?? 'application/json';
+          request.body = body;
+        } else if (body is List<int>) {
+          request.bodyBytes = body;
+        } else {
+          request.headers['Content-Type'] = 'application/json';
+          request.body = jsonEncode(body);
+        }
+      }
 
-    if (response.statusCode >= 400) {
+      final canRetry = safeToRepeat && attempt < policy.retries;
+      try {
+        final streamed = await _httpClient.send(request);
+        response = await http.Response.fromStream(streamed);
+      } catch (error) {
+        if (canRetry) {
+          await sleep(_backoff(policy, attempt, random));
+          continue;
+        }
+        throw TinyDBException('Network error: $error', 0);
+      }
+
+      if (response.statusCode < 400) {
+        break;
+      }
+      if (canRetry &&
+          const {429, 502, 503, 504}.contains(response.statusCode)) {
+        final retryAfter = _parseRetryAfter(response.headers['retry-after']);
+        // A 429 without Retry-After is usually a daily quota: waiting seconds will not help.
+        final waitable = response.statusCode != 429 ||
+            (retryAfter != null && retryAfter <= policy.maxRetryAfter);
+        if (waitable) {
+          await sleep(retryAfter ?? _backoff(policy, attempt, random));
+          continue;
+        }
+      }
       throw _parseError(response);
     }
 
@@ -1192,6 +1410,31 @@ class TinyDBClient {
     }
 
     return decoded as R;
+  }
+
+  static final math.Random _jitter = math.Random();
+
+  static Duration _backoff(
+      RetryPolicy policy, int attempt, double Function() random) {
+    final ceilingMs = math.min(policy.maxDelay.inMilliseconds,
+        policy.baseDelay.inMilliseconds * (1 << attempt));
+    return Duration(milliseconds: (random() * ceilingMs).floor());
+  }
+
+  /// Parses a Retry-After header: seconds or an HTTP date.
+  static Duration? _parseRetryAfter(String? value) {
+    if (value == null || value.isEmpty) return null;
+    final seconds = num.tryParse(value);
+    if (seconds != null && seconds >= 0) {
+      return Duration(milliseconds: (seconds * 1000).round());
+    }
+    try {
+      final at = HttpDate.parse(value);
+      final wait = at.difference(DateTime.now().toUtc());
+      return wait.isNegative ? Duration.zero : wait;
+    } catch (_) {
+      return null;
+    }
   }
 
   Uri _buildUri(String path, Map<String, String?>? query) {
@@ -1245,6 +1488,8 @@ class TinyDBClient {
   }) {
     final uri = _buildWebSocketUri(path, query: query);
     final headers = <String, dynamic>{
+      // The server authenticates with X-API-Key; the Bearer form is kept for proxies.
+      'x-api-key': _apiKey,
       'authorization': 'Bearer $_apiKey',
       'user-agent':
           'tinydb-sdk-dart/v${VersionReader.getVersion() ?? "0.1.0"} (+https://github.com/cubetiqlabs/tinydb-sdk-dart)',
@@ -1276,13 +1521,45 @@ class TinyDBClient {
             response.reasonPhrase ??
             'Request failed')
         : (response.reasonPhrase ?? 'Request failed');
-    final code = payload is Map<String, dynamic> ? payload['code'] : null;
+    final code =
+        (payload is Map<String, dynamic> ? payload['code'] : null)?.toString();
+    final requestId = response.headers['x-request-id'];
+    final text = message.toString();
+    switch (response.statusCode) {
+      case 401:
+        return UnauthorizedException(text,
+            code: code, details: payload, requestId: requestId);
+      case 403:
+        return ForbiddenException(text,
+            code: code, details: payload, requestId: requestId);
+      case 404:
+        return NotFoundException(text,
+            code: code, details: payload, requestId: requestId);
+      case 409:
+      case 412:
+        return ConflictException(text, response.statusCode,
+            code: code, details: payload, requestId: requestId);
+      case 400:
+      case 422:
+        return ValidationException(text, response.statusCode,
+            code: code, details: payload, requestId: requestId);
+      case 429:
+        return RateLimitException(text,
+            retryAfter: _parseRetryAfter(response.headers['retry-after']),
+            code: code,
+            details: payload,
+            requestId: requestId);
+    }
+    if (response.statusCode >= 500) {
+      return ServerException(text, response.statusCode,
+          code: code, details: payload, requestId: requestId);
+    }
     return TinyDBException(
-      message.toString(),
+      text,
       response.statusCode,
-      code: code?.toString(),
+      code: code,
       details: payload,
-      requestId: response.headers['x-request-id'],
+      requestId: requestId,
     );
   }
 }
@@ -1452,25 +1729,32 @@ class CollectionClient<T extends Map<String, dynamic>> {
         '/api/collections/${Uri.encodeComponent(name)}/documents/primary/${Uri.encodeComponent(key)}',
       );
 
-  Future<DocumentRecord<T>> create(Map<String, dynamic> doc) async {
+  /// Creates a document. Pass an [idempotencyKey] (see [newIdempotencyKey]) to
+  /// make the call safe to retry: the server stores the first response for 24
+  /// hours and replays it for the same key, and the client retries transient
+  /// failures only when a key is present.
+  Future<DocumentRecord<T>> create(Map<String, dynamic> doc,
+      {String? idempotencyKey}) async {
     final response = await _client._request<Map<String, dynamic>>(
       method: 'POST',
       path: '/api/collections/${Uri.encodeComponent(name)}/documents',
       body: doc,
+      idempotencyKey: idempotencyKey,
     );
     return _parseDocument<T>(response);
   }
 
   Future<List<DocumentRecord<T>>> createMany(List<Map<String, dynamic>> docs,
       {bool?
-          sync} // whether to sync the records upon creation (if pk exists, they will be updated instead)
-      ) async {
+          sync, // whether to sync the records upon creation (if pk exists, they will be updated instead)
+      String? idempotencyKey}) async {
     if (docs.isEmpty) return const [];
     final response = await _client._request<Map<String, dynamic>>(
       method: 'POST',
       path:
           '/api/collections/${Uri.encodeComponent(name)}/documents/bulk?sync=${sync == true ? 'true' : 'false'}',
       body: docs,
+      idempotencyKey: idempotencyKey,
     );
     return (response['items'] as List<dynamic>? ?? [])
         .map((item) => _parseDocument<T>(item as Map<String, dynamic>))
@@ -1861,8 +2145,18 @@ class CollectionClient<T extends Map<String, dynamic>> {
     void Function(QueryProgress progress)? onProgress,
     CancellationToken? cancellationToken,
     Duration? pingInterval,
+
+    /// Resume after this change [CollectionWatchEvent.seq]: the server replays
+    /// everything recorded since, then continues live.
+    int? since,
+
+    /// Reconnect (resuming after the last seq received) when the connection
+    /// drops. Default false, which closes the stream instead.
+    bool reconnect = false,
+    Duration reconnectDelay = const Duration(seconds: 1),
   }) {
     final token = cancellationToken ?? CancellationToken.none;
+    var lastSeq = since;
     final controller = StreamController<CollectionWatchEvent<T>>();
     WebSocketChannel? channel;
     StreamSubscription? subscription;
@@ -1990,6 +2284,11 @@ class CollectionClient<T extends Map<String, dynamic>> {
         timestamp = DateTime.fromMillisecondsSinceEpoch(ts, isUtc: true);
       }
 
+      final seq = (payload['seq'] as num?)?.toInt();
+      if (seq != null && (lastSeq == null || seq > lastSeq!)) {
+        lastSeq = seq;
+      }
+
       controller.add(CollectionWatchEvent<T>.change(
         kind: kind,
         documentId: document?.id ?? id,
@@ -1997,6 +2296,7 @@ class CollectionClient<T extends Map<String, dynamic>> {
         document: document,
         timestamp: timestamp,
         raw: payload,
+        seq: seq,
       ));
 
       if (kind != CollectionWatchEventKind.keepalive &&
@@ -2022,24 +2322,37 @@ class CollectionClient<T extends Map<String, dynamic>> {
             return;
           }
 
-          channel = _client._connectWebSocket(
-            '/subscribe/${Uri.encodeComponent(name)}',
-            pingInterval: pingInterval,
-          );
+          void connect() {
+            channel = _client._connectWebSocket(
+              '/subscribe/${Uri.encodeComponent(name)}',
+              query: {'since': lastSeq?.toString()},
+              pingInterval: pingInterval,
+            );
 
-          subscription = channel!.stream.listen(
-            handleRealtimeMessage,
-            onError: (error, stackTrace) async {
-              if (!controller.isClosed) {
-                controller.addError(error, stackTrace);
-              }
-              await closeController();
-            },
-            onDone: () async {
-              await closeController();
-            },
-            cancelOnError: false,
-          );
+            subscription = channel!.stream.listen(
+              handleRealtimeMessage,
+              onError: (error, stackTrace) async {
+                if (!controller.isClosed) {
+                  controller.addError(error, stackTrace);
+                }
+                await closeController();
+              },
+              onDone: () async {
+                if (reconnect && !closing && !token.isCancelled) {
+                  // Dropped: come back and ask for what was missed.
+                  await Future<void>.delayed(reconnectDelay);
+                  if (!closing && !token.isCancelled) {
+                    connect();
+                    return;
+                  }
+                }
+                await closeController();
+              },
+              cancelOnError: false,
+            );
+          }
+
+          connect();
         } catch (error, stackTrace) {
           if (!controller.isClosed) {
             controller.addError(error, stackTrace);
@@ -2088,6 +2401,8 @@ class CollectionClient<T extends Map<String, dynamic>> {
         return CollectionWatchEventKind.keepalive;
       case 'ack':
         return CollectionWatchEventKind.ack;
+      case 'lagged':
+        return CollectionWatchEventKind.lagged;
       default:
         return CollectionWatchEventKind.error;
     }
