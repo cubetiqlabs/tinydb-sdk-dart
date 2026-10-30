@@ -1070,6 +1070,37 @@ class TinyDBClient {
     return items.cast<JsonMap>();
   }
 
+  /// Snapshots (backups): create, list, verify, restore.
+  SnapshotsApi get snapshots => SnapshotsApi._(this);
+
+  /// Webhook subscriptions, deliveries and secret rotation. Needs a
+  /// tenant-scoped API key.
+  WebhooksApi get webhooks => WebhooksApi._(this);
+
+  /// Backup schedules. Needs a tenant-scoped API key.
+  SchedulesApi get schedules => SchedulesApi._(this);
+
+  /// Runs a report (tabular rows, aggregates, group-by). The server supports
+  /// reports on PostgreSQL only and answers 400 elsewhere.
+  Future<JsonMap> report(JsonMap request) =>
+      _request<JsonMap>(method: 'POST', path: '/api/query', body: request);
+
+  /// Upserts one record or a batch into [entity] through the schema-light
+  /// ingest path (records keyed by `external_id`). Pass an [idempotencyKey]
+  /// to make a retried call safe.
+  Future<JsonMap> ingest(String entity, Object records,
+      {String? idempotencyKey}) {
+    if (records is! Map && records is! List) {
+      throw ArgumentError('records must be a map or a list of maps');
+    }
+    return _request<JsonMap>(
+      method: 'POST',
+      path: '/api/ingest/${Uri.encodeComponent(entity)}',
+      body: records,
+      idempotencyKey: idempotencyKey,
+    );
+  }
+
   Future<CollectionCount> countCollections(
       {bool includeDeleted = false}) async {
     final response = await _request<Map<String, dynamic>>(
@@ -1562,6 +1593,272 @@ class TinyDBClient {
       requestId: requestId,
     );
   }
+}
+
+Map<String, String?> _page(int? limit, int? offset) =>
+    {'limit': limit?.toString(), 'offset': offset?.toString()};
+
+String _seg(String v) => Uri.encodeComponent(v);
+
+/// Collection, application and tenant snapshots. Reach it as
+/// [TinyDBClient.snapshots].
+class SnapshotsApi {
+  final TinyDBClient _c;
+  SnapshotsApi._(this._c);
+
+  JsonMap _body(String name, String? description, DateTime? expiresAt) => {
+        'name': name,
+        if (description != null) 'description': description,
+        if (expiresAt != null)
+          'expires_at': expiresAt.toUtc().toIso8601String(),
+      };
+
+  /// Snapshots a collection by id.
+  Future<JsonMap> create(String collectionId, String name,
+          {String? description, DateTime? expiresAt, String? idempotencyKey}) =>
+      _c._request<JsonMap>(
+        method: 'POST',
+        path: '/api/collections/${_seg(collectionId)}/snapshots',
+        body: _body(name, description, expiresAt),
+        idempotencyKey: idempotencyKey,
+      );
+
+  /// Snapshots a collection by name.
+  Future<JsonMap> createByName(String collectionName, String name,
+          {String? description, DateTime? expiresAt, String? idempotencyKey}) =>
+      _c._request<JsonMap>(
+        method: 'POST',
+        path: '/api/snapshots/by-name',
+        body: {
+          'collection_name': collectionName,
+          ..._body(name, description, expiresAt)
+        },
+        idempotencyKey: idempotencyKey,
+      );
+
+  /// Snapshots every collection of the tenant. Needs a tenant-scoped key.
+  Future<JsonMap> createTenant(String name,
+          {String? description, String? idempotencyKey}) =>
+      _c._request<JsonMap>(
+        method: 'POST',
+        path: '/api/snapshots/tenant',
+        body: _body(name, description, null),
+        idempotencyKey: idempotencyKey,
+      );
+
+  /// Snapshots every collection of an application.
+  Future<JsonMap> createApp(String appId, String name,
+          {String? description, String? idempotencyKey}) =>
+      _c._request<JsonMap>(
+        method: 'POST',
+        path: '/api/snapshots/app/${_seg(appId)}',
+        body: _body(name, description, null),
+        idempotencyKey: idempotencyKey,
+      );
+
+  /// Lists snapshot metadata: `{items: [...], pagination: {...}}`.
+  Future<JsonMap> list(String collectionId, {int? limit, int? offset}) =>
+      _c._request<JsonMap>(
+        method: 'GET',
+        path: '/api/collections/${_seg(collectionId)}/snapshots',
+        query: _page(limit, offset),
+      );
+
+  Future<JsonMap> get(String collectionId, String snapshotId) =>
+      _c._request<JsonMap>(
+        method: 'GET',
+        path:
+            '/api/collections/${_seg(collectionId)}/snapshots/${_seg(snapshotId)}',
+      );
+
+  Future<void> delete(String collectionId, String snapshotId) =>
+      _c._request<void>(
+        method: 'DELETE',
+        path:
+            '/api/collections/${_seg(collectionId)}/snapshots/${_seg(snapshotId)}',
+        expectResponseBody: false,
+      );
+
+  /// Restores a snapshot. With [targetCollection] it is restored into a new
+  /// collection and nothing existing is touched ([replaceAll] is then ignored
+  /// and not sent). A snapshot that fails its integrity check is refused with a
+  /// [ValidationException] (422) before anything changes.
+  Future<JsonMap> restore(String collectionId, String snapshotId,
+      {bool replaceAll = false, String? targetCollection}) {
+    final body = <String, dynamic>{};
+    if (targetCollection != null && targetCollection.isNotEmpty) {
+      body['target_collection'] = targetCollection;
+    } else if (replaceAll) {
+      body['replace_all'] = true;
+    }
+    return _c._request<JsonMap>(
+      method: 'POST',
+      path:
+          '/api/collections/${_seg(collectionId)}/snapshots/${_seg(snapshotId)}/restore',
+      body: body,
+    );
+  }
+
+  /// Checks a snapshot's integrity without restoring it (a dry-run restore).
+  /// The answer has `valid`, `checksum_recorded`, `problems` and, for a
+  /// collection snapshot, `existing_documents`.
+  Future<JsonMap> verify(String collectionId, String snapshotId) =>
+      _c._request<JsonMap>(
+        method: 'POST',
+        path:
+            '/api/collections/${_seg(collectionId)}/snapshots/${_seg(snapshotId)}/verify',
+      );
+
+  Future<JsonMap> verifyTenant(String snapshotId) => _c._request<JsonMap>(
+        method: 'POST',
+        path: '/api/snapshots/tenant/${_seg(snapshotId)}/verify',
+      );
+
+  Future<JsonMap> verifyApp(String snapshotId) => _c._request<JsonMap>(
+        method: 'POST',
+        path: '/api/snapshots/app/snapshot/${_seg(snapshotId)}/verify',
+      );
+
+  Future<JsonMap> restoreTenant(String snapshotId, {bool replaceAll = false}) =>
+      _c._request<JsonMap>(
+        method: 'POST',
+        path: '/api/snapshots/tenant/${_seg(snapshotId)}/restore',
+        body: replaceAll ? {'replace_all': true} : <String, dynamic>{},
+      );
+
+  Future<JsonMap> restoreApp(String snapshotId, {bool replaceAll = false}) =>
+      _c._request<JsonMap>(
+        method: 'POST',
+        path: '/api/snapshots/app/snapshot/${_seg(snapshotId)}/restore',
+        body: replaceAll ? {'replace_all': true} : <String, dynamic>{},
+      );
+}
+
+/// Webhook subscriptions. Reach it as [TinyDBClient.webhooks].
+class WebhooksApi {
+  final TinyDBClient _c;
+  WebhooksApi._(this._c);
+
+  /// Creates a subscription. [input] needs `name`, `url` and `events`. The
+  /// answer carries the signing `secret` once: store it.
+  Future<JsonMap> create(JsonMap input, {String? idempotencyKey}) =>
+      _c._request<JsonMap>(
+        method: 'POST',
+        path: '/api/webhooks',
+        body: input,
+        idempotencyKey: idempotencyKey,
+      );
+
+  Future<JsonMap> list({int? limit, int? offset}) => _c._request<JsonMap>(
+        method: 'GET',
+        path: '/api/webhooks',
+        query: _page(limit, offset),
+      );
+
+  Future<JsonMap> get(String id) =>
+      _c._request<JsonMap>(method: 'GET', path: '/api/webhooks/${_seg(id)}');
+
+  Future<JsonMap> update(String id, JsonMap changes) => _c._request<JsonMap>(
+        method: 'PUT',
+        path: '/api/webhooks/${_seg(id)}',
+        body: changes,
+      );
+
+  Future<void> delete(String id) => _c._request<void>(
+        method: 'DELETE',
+        path: '/api/webhooks/${_seg(id)}',
+        expectResponseBody: false,
+      );
+
+  /// Sends a test event now.
+  Future<JsonMap> test(String id) => _c._request<JsonMap>(
+      method: 'POST', path: '/api/webhooks/${_seg(id)}/test');
+
+  /// Issues a new signing secret (in the answer's `secret`, once); the old one
+  /// stops working at once.
+  Future<JsonMap> rotateSecret(String id) => _c._request<JsonMap>(
+      method: 'POST', path: '/api/webhooks/${_seg(id)}/rotate-secret');
+
+  Future<JsonMap> deliveries(String id, {int? limit, int? offset}) =>
+      _c._request<JsonMap>(
+        method: 'GET',
+        path: '/api/webhooks/${_seg(id)}/deliveries',
+        query: _page(limit, offset),
+      );
+
+  Future<JsonMap> delivery(String deliveryId) => _c._request<JsonMap>(
+      method: 'GET', path: '/api/webhooks/deliveries/${_seg(deliveryId)}');
+
+  /// Queues the same event again as a new delivery; the original stays as history.
+  Future<JsonMap> redeliver(String deliveryId) => _c._request<JsonMap>(
+      method: 'POST',
+      path: '/api/webhooks/deliveries/${_seg(deliveryId)}/redeliver');
+
+  /// Streams every subscription, [pageSize] at a time.
+  Stream<JsonMap> stream({int pageSize = 100}) async* {
+    var offset = 0;
+    while (true) {
+      final page = await list(limit: pageSize, offset: offset);
+      final items = (page['items'] as List? ?? const []).cast<JsonMap>();
+      for (final w in items) {
+        yield w;
+      }
+      offset += items.length;
+      final total = (page['pagination']?['total'] as num?)?.toInt();
+      if (items.length < pageSize || (total != null && offset >= total)) return;
+    }
+  }
+}
+
+/// Backup schedules. Reach it as [TinyDBClient.schedules].
+class SchedulesApi {
+  final TinyDBClient _c;
+  SchedulesApi._(this._c);
+
+  /// Creates a schedule. [input] needs `collection_id`, `name` and a
+  /// five-field `cron_expression`; `retention_policy` takes `keep_last`,
+  /// `keep_days`, `keep_daily`, `keep_weekly`, `keep_monthly`.
+  Future<JsonMap> create(JsonMap input, {String? idempotencyKey}) =>
+      _c._request<JsonMap>(
+        method: 'POST',
+        path: '/api/schedules',
+        body: input,
+        idempotencyKey: idempotencyKey,
+      );
+
+  /// Lists schedules: `{schedules: [...], total, limit, offset}`.
+  Future<JsonMap> list({int? limit, int? offset}) => _c._request<JsonMap>(
+        method: 'GET',
+        path: '/api/schedules',
+        query: _page(limit, offset),
+      );
+
+  Future<JsonMap> get(String id) =>
+      _c._request<JsonMap>(method: 'GET', path: '/api/schedules/${_seg(id)}');
+
+  Future<JsonMap> update(String id, JsonMap changes) => _c._request<JsonMap>(
+        method: 'PUT',
+        path: '/api/schedules/${_seg(id)}',
+        body: changes,
+      );
+
+  Future<void> delete(String id) => _c._request<void>(
+        method: 'DELETE',
+        path: '/api/schedules/${_seg(id)}',
+        expectResponseBody: false,
+      );
+
+  /// Runs the schedule now and returns the execution record.
+  Future<JsonMap> trigger(String id) => _c._request<JsonMap>(
+      method: 'POST', path: '/api/schedules/${_seg(id)}/trigger');
+
+  /// Lists past runs: `{executions: [...], total, limit, offset}`.
+  Future<JsonMap> executions(String id, {int? limit, int? offset}) =>
+      _c._request<JsonMap>(
+        method: 'GET',
+        path: '/api/schedules/${_seg(id)}/executions',
+        query: _page(limit, offset),
+      );
 }
 
 class CollectionBuilder<T extends Map<String, dynamic>>

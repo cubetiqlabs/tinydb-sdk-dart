@@ -230,6 +230,40 @@ if (!verdict.ok) print('broken at ${verdict.brokenSeq}: ${verdict.reason}');
 final rows = await client.audit(operation: 'update', limit: 50);
 ```
 
+### Snapshots, webhooks, schedules, reports and ingest
+
+`client.snapshots`, `client.webhooks`, `client.schedules`, `client.report()` and `client.ingest()` cover the rest of the API. Webhooks and schedules need a tenant-scoped key (an application key gets `ForbiddenException`). Results are `JsonMap`s.
+
+```dart
+final snap = await client.snapshots.create(collectionId, 'before-migration');
+final verdict = await client.snapshots.verify(collectionId, snap['id'] as String);
+if (verdict['valid'] != true) throw StateError('${verdict['problems']}');
+
+// Restore into a new collection: nothing existing is touched.
+await client.snapshots.restore(collectionId, snap['id'] as String,
+    targetCollection: 'orders_recovered');
+
+final hook = await client.webhooks.create({
+  'name': 'orders', 'url': 'https://example.com/hook', 'events': ['document.created'],
+});
+saveSecret(hook['secret']); // shown only on create and rotateSecret()
+await client.webhooks.redeliver(deliveryId);
+await for (final w in client.webhooks.stream()) { /* every subscription */ }
+
+await client.schedules.create({
+  'collection_id': collectionId, 'name': 'nightly', 'cron_expression': '0 3 * * *',
+  'retention_policy': {'keep_daily': 7},
+});
+
+final report = await client.report({
+  'collection': 'orders', 'groupBy': ['region'],
+  'aggregate': [{'alias': 'revenue', 'operation': 'sum', 'field': 'total'}],
+}); // PostgreSQL servers only
+await client.ingest('items', [{'external_id': 'A1', 'name': 'Widget'}], idempotencyKey: newIdempotencyKey());
+```
+
+A snapshot that fails its integrity check is refused with a `ValidationException` (422) before anything changes.
+
 ### Run the example against a real API
 
 ```bash

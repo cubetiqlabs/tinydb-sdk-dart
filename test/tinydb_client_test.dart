@@ -2301,6 +2301,220 @@ void main() {
       await done.timeout(const Duration(seconds: 5));
     });
   });
+
+  group('snapshots, webhooks, schedules, report and ingest', () {
+    final seen = <String>[];
+    final bodies = <dynamic>[];
+    final queries = <Map<String, String>>[];
+    final keys = <String?>[];
+
+    TinyDBClient make([http.Response Function(http.Request)? answer]) {
+      seen.clear();
+      bodies.clear();
+      queries.clear();
+      keys.clear();
+      return TinyDBClient(
+        endpoint: 'https://db.example.com',
+        apiKey: 'k',
+        retryPolicy: RetryPolicy.none,
+        httpClient: MockClient((r) async {
+          seen.add('${r.method} ${r.url.path}');
+          queries.add(r.url.queryParameters);
+          keys.add(r.headers['Idempotency-Key']);
+          bodies.add(r.body.isEmpty ? null : jsonDecode(r.body));
+          return (answer ??
+              (_) => http.Response('{}', 200,
+                  headers: {'content-type': 'application/json'}))(r);
+        }),
+      );
+    }
+
+    test('snapshots wire every call to the right route', () async {
+      final c = make();
+      await c.snapshots.create('col 1', 'before',
+          description: 'd',
+          expiresAt: DateTime.utc(2027, 1, 1),
+          idempotencyKey: 'k-1');
+      await c.snapshots.createByName('orders', 'nightly');
+      await c.snapshots.createTenant('all');
+      await c.snapshots.createApp('app-1', 'app');
+      await c.snapshots.list('c1', limit: 5, offset: 10);
+      await c.snapshots.get('c1', 's1');
+      await c.snapshots.verify('c1', 's1');
+      await c.snapshots.verifyTenant('s2');
+      await c.snapshots.verifyApp('s3');
+      await c.snapshots.restoreTenant('s2', replaceAll: true);
+      await c.snapshots.restoreApp('s3');
+      await c.snapshots.delete('c1', 's1');
+
+      expect(seen, [
+        'POST /api/collections/col%201/snapshots',
+        'POST /api/snapshots/by-name',
+        'POST /api/snapshots/tenant',
+        'POST /api/snapshots/app/app-1',
+        'GET /api/collections/c1/snapshots',
+        'GET /api/collections/c1/snapshots/s1',
+        'POST /api/collections/c1/snapshots/s1/verify',
+        'POST /api/snapshots/tenant/s2/verify',
+        'POST /api/snapshots/app/snapshot/s3/verify',
+        'POST /api/snapshots/tenant/s2/restore',
+        'POST /api/snapshots/app/snapshot/s3/restore',
+        'DELETE /api/collections/c1/snapshots/s1',
+      ]);
+      expect(bodies[0], {
+        'name': 'before',
+        'description': 'd',
+        'expires_at': '2027-01-01T00:00:00.000Z'
+      });
+      expect(keys[0], 'k-1');
+      expect(bodies[1]['collection_name'], 'orders');
+      expect(queries[4], {'limit': '5', 'offset': '10'});
+      expect(bodies[9], {'replace_all': true});
+    });
+
+    test('restore: in place, replacing, or into a new collection', () async {
+      final c = make();
+      await c.snapshots.restore('c1', 's1');
+      await c.snapshots.restore('c1', 's1', replaceAll: true);
+      await c.snapshots
+          .restore('c1', 's1', replaceAll: true, targetCollection: 'recovered');
+      expect(bodies[0], <String, dynamic>{});
+      expect(bodies[1], {'replace_all': true});
+      // Into a new collection nothing is deleted, so replace_all is not sent.
+      expect(bodies[2], {'target_collection': 'recovered'});
+    });
+
+    test('a corrupt snapshot is a ValidationException', () async {
+      final c = make((_) => http.Response(
+          jsonEncode({'message': 'failed its integrity check'}), 422,
+          headers: {'content-type': 'application/json'}));
+      await expectLater(
+          c.snapshots.restore('c1', 's1'), throwsA(isA<ValidationException>()));
+    });
+
+    test('webhooks: secret only from create/rotate, every route wired',
+        () async {
+      final c = make();
+      await c.webhooks.create({
+        'name': 'n',
+        'url': 'https://x.test',
+        'events': ['document.created']
+      }, idempotencyKey: 'w-1');
+      await c.webhooks.get('w1');
+      await c.webhooks.update('w1', {'enabled': false});
+      await c.webhooks.rotateSecret('w1');
+      await c.webhooks.delivery('d1');
+      await c.webhooks.redeliver('d1');
+      await c.webhooks.deliveries('w1', limit: 20);
+      await c.webhooks.test('w1');
+      await c.webhooks.delete('w1');
+      expect(seen, [
+        'POST /api/webhooks',
+        'GET /api/webhooks/w1',
+        'PUT /api/webhooks/w1',
+        'POST /api/webhooks/w1/rotate-secret',
+        'GET /api/webhooks/deliveries/d1',
+        'POST /api/webhooks/deliveries/d1/redeliver',
+        'GET /api/webhooks/w1/deliveries',
+        'POST /api/webhooks/w1/test',
+        'DELETE /api/webhooks/w1',
+      ]);
+      expect(keys[0], 'w-1');
+      expect(bodies[2], {'enabled': false});
+    });
+
+    test('webhooks.stream pages until the total is reached', () async {
+      var call = 0;
+      final c = make((r) {
+        call++;
+        final items = call == 1
+            ? [
+                {'id': 'w0'},
+                {'id': 'w1'}
+              ]
+            : [
+                {'id': 'w2'}
+              ];
+        return http.Response(
+            jsonEncode({
+              'items': items,
+              'pagination': {'total': 3}
+            }),
+            200,
+            headers: {'content-type': 'application/json'});
+      });
+      final ids =
+          await c.webhooks.stream(pageSize: 2).map((w) => w['id']).toList();
+      expect(ids, ['w0', 'w1', 'w2']);
+      expect(queries.map((q) => q['offset']), ['0', '2']);
+    });
+
+    test('an app-scoped key is a ForbiddenException on tenant-wide routes',
+        () async {
+      final c = make((_) => http.Response(
+          jsonEncode({'message': 'requires a tenant-scoped API key'}), 403,
+          headers: {'content-type': 'application/json'}));
+      await expectLater(c.webhooks.list(), throwsA(isA<ForbiddenException>()));
+    });
+
+    test('schedules wire create, list, trigger, executions, update, delete',
+        () async {
+      final c = make();
+      await c.schedules.create({
+        'collection_id': 'c1',
+        'name': 'nightly',
+        'cron_expression': '0 3 * * *',
+        'retention_policy': {'keep_daily': 7},
+      });
+      await c.schedules.list();
+      await c.schedules.get('sch1');
+      await c.schedules.trigger('sch1');
+      await c.schedules.executions('sch1', limit: 10);
+      await c.schedules.update('sch1', {'enabled': false});
+      await c.schedules.delete('sch1');
+      expect(seen, [
+        'POST /api/schedules',
+        'GET /api/schedules',
+        'GET /api/schedules/sch1',
+        'POST /api/schedules/sch1/trigger',
+        'GET /api/schedules/sch1/executions',
+        'PUT /api/schedules/sch1',
+        'DELETE /api/schedules/sch1',
+      ]);
+      expect(bodies[0]['retention_policy'], {'keep_daily': 7});
+    });
+
+    test('report posts to /api/query; ingest takes one record or a batch',
+        () async {
+      final c = make((_) => http.Response(
+          jsonEncode({'data': [], 'ok': true}), 200,
+          headers: {'content-type': 'application/json'}));
+      final r = await c.report({
+        'collection': 'orders',
+        'groupBy': ['region'],
+        'aggregate': [
+          {'alias': 'revenue', 'operation': 'sum', 'field': 'total'}
+        ],
+      });
+      await c.ingest('items', {'external_id': 'A', 'name': 'Widget'});
+      await c.ingest(
+          'items',
+          [
+            {'external_id': 'A'},
+            {'external_id': 'B'}
+          ],
+          idempotencyKey: 'batch-1');
+      expect(r['data'], isEmpty);
+      expect(seen, [
+        'POST /api/query',
+        'POST /api/ingest/items',
+        'POST /api/ingest/items'
+      ]);
+      expect(bodies[2], isA<List>());
+      expect(keys[2], 'batch-1');
+      expect(() => c.ingest('items', 'not a record'), throwsArgumentError);
+    });
+  });
 }
 
 class TestWebSocketChannel with StreamChannelMixin implements WebSocketChannel {
